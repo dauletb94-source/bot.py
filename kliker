@@ -1,0 +1,386 @@
+# orc_agent.py
+import cv2
+import numpy as np
+import pyautogui
+import time
+import logging
+from pathlib import Path
+
+try:
+    import keyboard
+except ImportError:
+    keyboard = None
+
+try:
+    import pygetwindow as gw
+except ImportError:
+    gw = None
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+
+pyautogui.FAILSAFE = True
+pyautogui.PAUSE = 0.2
+
+
+class OrcAgent:
+    def __init__(self, assets_dir="assets", debug_dir="debug"):
+        self.assets_dir = Path(assets_dir)
+        self.debug_dir = Path(debug_dir)
+        self.debug_dir.mkdir(exist_ok=True)
+        self.stop_requested = False
+
+        # Шаблоны для кликов
+        self.templates = {
+            "pair_input.png": {"threshold": 0.60, "grayscale": True},
+            "stake_input.png": {"threshold": 0.60, "grayscale": True},
+            "buy_button.png": {"threshold": 0.68, "grayscale": False},
+            "sell_button.png": {"threshold": 0.68, "grayscale": False},
+        }
+
+    def install_hotkeys(self):
+        if keyboard is not None:
+            keyboard.add_hotkey("F9", self.request_stop)
+            logger.info("F9 hotkey registered")
+
+    def request_stop(self):
+        self.stop_requested = True
+        logger.warning("F9 pressed, stopping")
+
+    def check_stop(self):
+        if self.stop_requested:
+            raise KeyboardInterrupt("Stopped by F9")
+
+    def validate_assets(self):
+        if not self.assets_dir.exists():
+            raise FileNotFoundError(f"Folder not found: {self.assets_dir.resolve()}")
+
+        missing = []
+        for name in self.templates:
+            if not (self.assets_dir / name).exists():
+                missing.append(name)
+
+        if missing:
+            raise FileNotFoundError("Missing templates: " + ", ".join(missing))
+
+    def capture_screen(self):
+        self.check_stop()
+        img = pyautogui.screenshot()
+        rgb = np.array(img)
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        return bgr
+
+    def save_image(self, name, image):
+        path = self.debug_dir / name
+        cv2.imwrite(str(path), image)
+        return path
+
+    def load_template(self, template_name):
+        path = self.assets_dir / template_name
+        template = cv2.imread(str(path))
+        if template is None:
+            raise RuntimeError(f"Failed to read template: {path}")
+        return template
+
+    def run_match(self, screen_bgr, template_bgr, grayscale=False):
+        if grayscale:
+            screen_src = cv2.cvtColor(screen_bgr, cv2.COLOR_BGR2GRAY)
+            template_src = cv2.cvtColor(template_bgr, cv2.COLOR_BGR2GRAY)
+        else:
+            screen_src = screen_bgr
+            template_src = template_bgr
+
+        result = cv2.matchTemplate(screen_src, template_src, cv2.TM_CCOEFF_NORMED)
+        return result
+
+    def top_candidates(self, result, template_size, k=5, min_distance=60):
+        flat = result.flatten()
+        idxs = np.argpartition(flat, -k * 10)[-k * 10:]
+        idxs = idxs[np.argsort(flat[idxs])[::-1]]
+
+        h, w = template_size
+        candidates = []
+
+        for idx in idxs:
+            score = float(flat[idx])
+            y, x = np.unravel_index(idx, result.shape)
+            cx = int(x + w // 2)
+            cy = int(y + h // 2)
+
+            too_close = False
+            for c in candidates:
+                px, py = c["center"]
+                if abs(cx - px) < min_distance and abs(cy - py) < min_distance:
+                    too_close = True
+                    break
+
+            if too_close:
+                continue
+
+            candidates.append({
+                "score": score,
+                "top_left": (int(x), int(y)),
+                "center": (cx, cy),
+                "size": (int(w), int(h)),
+            })
+
+            if len(candidates) >= k:
+                break
+
+        return candidates
+
+    def locate_best(self, screen_bgr, template_name):
+        self.check_stop()
+
+        cfg = self.templates[template_name]
+        template = self.load_template(template_name)
+
+        color_result = self.run_match(screen_bgr, template, grayscale=False)
+        gray_result = self.run_match(screen_bgr, template, grayscale=True)
+
+        color_candidates = self.top_candidates(color_result, template.shape[:2], k=5)
+        gray_candidates = self.top_candidates(gray_result, template.shape[:2], k=5)
+
+        best_color = color_candidates[0] if color_candidates else None
+        best_gray = gray_candidates[0] if gray_candidates else None
+
+        use_gray = False
+        if best_color and best_gray:
+            use_gray = best_gray["score"] > best_color["score"]
+        elif best_gray and not best_color:
+            use_gray = True
+
+        selected = best_gray if use_gray else best_color
+        mode = "grayscale" if use_gray else "color"
+        all_candidates = gray_candidates if use_gray else color_candidates
+
+        if selected is None:
+            return {
+                "template": template_name,
+                "mode": mode,
+                "threshold": cfg["threshold"],
+                "ok": False,
+                "best": None,
+                "candidates": [],
+                "heatmap": gray_result if use_gray else color_result,
+            }
+
+        return {
+            "template": template_name,
+            "mode": mode,
+            "threshold": cfg["threshold"],
+            "ok": selected["score"] >= cfg["threshold"],
+            "best": selected,
+            "candidates": all_candidates,
+            "heatmap": gray_result if use_gray else color_result,
+        }
+
+    # ===== НОВЫЙ click_element С НОВЫМ СКРИНОМ =====
+    def click_element(self, template_name, region=None):
+        """Кликает по элементу по свежему скриншоту"""
+        screen_bgr = self.capture_screen()
+
+        offset_x = 0
+        offset_y = 0
+
+        if region is not None:
+            x, y, w, h = region
+            screen_bgr = screen_bgr[y:y+h, x:x+w]
+            offset_x = x
+            offset_y = y
+
+        det = self.locate_best(screen_bgr, template_name)
+        if det["ok"] and det["best"]:
+            cx, cy = det["best"]["center"]
+            cx += offset_x
+            cy += offset_y
+            pyautogui.click(cx, cy)
+            logger.info(f"🖱️ Клик по {template_name} в ({cx}, {cy})")
+            return True
+
+        logger.warning(f"❌ Не удалось кликнуть по {template_name}")
+        return False
+
+    # ===== ОЧИСТКА ПОЛЯ И ВВОД =====
+    def clear_and_type(self, text: str):
+        pyautogui.hotkey("ctrl", "a")
+        time.sleep(0.1)
+        pyautogui.press("backspace")
+        time.sleep(0.1)
+        pyautogui.typewrite(str(text))
+        logger.info(f"⌨️ Введено: {text}")
+
+    # ===== НОВАЯ ФУНКЦИЯ ПОИСКА PNG =====
+    def find_template(self, screen, template_path, threshold=0.6):
+        """Ищет шаблон на экране. Возвращает центр, если найден."""
+        # Попытка 1: OpenCV
+        template = cv2.imread(template_path)
+        if template is None:
+            logger.error(f"[ERROR] Не найден файл: {template_path}")
+            return None
+
+        result = cv2.matchTemplate(screen, template, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, max_loc = cv2.minMaxLoc(result)
+
+        if max_val >= threshold:
+            h, w = template.shape[:2]
+            logger.info(f"[OK] SEARCH найден через OpenCV {max_loc} conf={max_val:.2f}")
+            return {
+                "type": "search_box",
+                "center": (max_loc[0] + w // 2, max_loc[1] + h // 2),
+                "box": (max_loc[0], max_loc[1], w, h),
+                "confidence": max_val
+            }
+
+        # Попытка 2: pyautogui.locateOnScreen (если OpenCV не нашёл)
+        logger.warning("⚠️ OpenCV не нашёл search_box — пробуем pyautogui...")
+        try:
+            box = pyautogui.locateOnScreen(template_path, confidence=0.6, grayscale=True)
+            if box:
+                center = pyautogui.center(box)
+                logger.info(f"[OK] SEARCH найден через pyautogui {center}")
+                return {
+                    "type": "search_box",
+                    "center": center,
+                    "box": box,
+                    "confidence": 0.6
+                }
+
+            # Попытка 3: с region
+            logger.warning("⚠️ pyautogui не нашёл search_box — пробуем с region...")
+            box = pyautogui.locateOnScreen(
+                template_path,
+                region=(200, 200, 1200, 500),
+                confidence=0.45,
+                grayscale=True
+            )
+            if box:
+                center = pyautogui.center(box)
+                logger.info(f"[OK] SEARCH найден через pyautogui с region {center}")
+                return {
+                    "type": "search_box",
+                    "center": center,
+                    "box": box,
+                    "confidence": 0.45
+                }
+        except Exception as e:
+            logger.error(f"Ошибка pyautogui.locateOnScreen: {e}")
+
+        logger.error("❌ SEARCH не найден ни через OpenCV, ни через pyautogui")
+        return None
+
+    # ===== ОСНОВНАЯ ФУНКЦИЯ ТОРГОВЛИ =====
+    def trade(self, pair: str, direction: str, stake: float, duration: int, otc: bool = False):
+        """
+        Выполняет полную торговлю:
+        1. Клик на заголовок -> Поиск search_box.png -> Ввод пары
+        2. Если OTC — ищем и кликаем otc_label.png
+        3. Ввод суммы (без клика по времени)
+        4. Клик по кнопке BUY/SELL
+        """
+        logger.info(f"🚀 TRADE: {direction} {pair} {'OTC' if otc else ''} {duration}M stake=${stake}")
+
+        # 1. Ввод пары
+        logger.info("🔍 Ввод пары...")
+
+        # Шаг 1: Клик на заголовок (чтобы открыть меню)
+        clicked = self.click_element("pair_input.png")
+        if not clicked:
+            logger.warning("⚠️ Шаблон pair_input.png не найден. Пробуем кликнуть по координатам (250, 240).")
+            pyautogui.click(250, 240)
+
+        time.sleep(0.6)  # Ждем, пока откроется меню
+
+        # Шаг 2: Ищем search_box.png
+        logger.info("🔍 Ищем search_box.png...")
+        # Делаем скриншот для поиска search_box
+        screen = self.capture_screen()
+        search_box = self.find_template(screen, "assets/search_box.png", threshold=0.6)
+
+        if search_box:
+            logger.info(f"[OK] SEARCH найден {search_box['center']} conf={search_box['confidence']:.2f}")
+            x, y = search_box["center"]
+            pyautogui.click(x, y)
+        else:
+            logger.warning("[X] SEARCH не найден. Пробуем кликнуть по координатам (450, 300).")
+            pyautogui.click(450, 300)  # Запасные координаты
+
+        time.sleep(0.4)  # Ждем, пока поле активируется
+
+        # Вводим только пару (без OTC)
+        pyautogui.typewrite(pair.replace("/", ""))
+        pyautogui.press('enter')
+        time.sleep(0.5)
+
+        # 2. Если OTC — ищем и кликаем otc_label.png
+        if otc:
+            logger.info("🔍 Ищем otc_label.png...")
+            otc_found = False
+            try:
+                # Попытка 1: точный поиск
+                otc_box = pyautogui.locateOnScreen(
+                    "assets/otc_label.png",
+                    confidence=0.7,
+                    grayscale=False
+                )
+                if otc_box:
+                    x, y = pyautogui.center(otc_box)
+                    logger.info(f"✅ OTC найден (точно) в ({x}, {y})")
+                    # Кликаем точно в центр
+                    pyautogui.click(x, y)  # 👈 КЛИКАЕМ В ЦЕНТР
+                    otc_found = True
+                else:
+                    logger.warning("⚠️ OTC не найден (точно)")
+
+                # Попытка 2: с region
+                if not otc_found:
+                    otc_box = pyautogui.locateOnScreen(
+                        "assets/otc_label.png",
+                        region=(300, 200, 800, 400),
+                        confidence=0.5,
+                        grayscale=False
+                    )
+                    if otc_box:
+                        x, y = pyautogui.center(otc_box)
+                        logger.info(f"✅ OTC найден (регион) в ({x}, {y})")
+                        pyautogui.click(x, y)  # 👈 КЛИКАЕМ В ЦЕНТР
+                        otc_found = True
+                    else:
+                        logger.warning("⚠️ OTC не найден (регион)")
+
+            except Exception as e:
+                logger.error(f"Ошибка поиска OTC: {e}")
+
+            # Если нашли — нажимаем Enter дважды
+            if otc_found:
+                pyautogui.press("enter")
+                time.sleep(0.3)
+                pyautogui.press("enter")
+                time.sleep(0.5)
+            else:
+                logger.error("❌ OTC не найден — пропускаем")
+                time.sleep(0.5)
+        else:
+            time.sleep(0.5)
+
+        # 3. Ввод суммы (без клика по времени)
+        logger.info("🔍 Ввод суммы...")
+        # Ищем сумму только в правой панели
+        stake_region = (2350, 250, 400, 500)   # подгони под свой экран
+        if self.click_element("stake_input.png", region=stake_region):
+            time.sleep(0.6)
+            self.clear_and_type(stake)
+            time.sleep(0.5)
+        else:
+            logger.error("❌ Не удалось кликнуть по полю ставки")
+
+        # 4. Клик по кнопке
+        btn_template = "buy_button.png" if direction.upper() == "BUY" else "sell_button.png"
+        logger.info(f"🔍 Клик по кнопке {direction}...")
+        button_region = (2350, 700, 400, 500)   # правая нижняя часть
+        if self.click_element(btn_template, region=button_region):
+            logger.info("✅ Торговля выполнена")
+        else:
+            logger.error("❌ Не удалось кликнуть по кнопке")
+
+
